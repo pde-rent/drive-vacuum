@@ -47,7 +47,7 @@ const HELP = `${BANNER}
     --verbose, -v           Debug output
     --help, -h              Show this help
 
-  EXPORTS  Docs->MD  Sheets->CSV  Slides->PDF  Drawings->PNG
+  EXPORTS  Docs->DOCX  Sheets->XLSX  Slides->PDF  Drawings->SVG
 
   EXAMPLES
     drive-vacuum 1A2B3C4D5E -o ./backup -k ./sa.json

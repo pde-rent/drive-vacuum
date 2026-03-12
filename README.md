@@ -17,7 +17,7 @@ Recursively download all files from a Google Drive folder using a service accoun
 ## Features
 
 - Recursive folder traversal with full structure preservation
-- Google Workspace exports (Docs to Markdown, Sheets to CSV, Slides to PDF, Drawings to PNG)
+- Google Workspace exports with full fidelity (Docs to DOCX, Sheets to XLSX, Slides to PDF, Drawings to SVG)
 - Gitignore-style filtering via `.vacuumignore`
 - Concurrent downloads with configurable parallelism
 - Shortcut resolution
@@ -103,11 +103,15 @@ Built-in ignores (always active): `.DS_Store`, `Thumbs.db`
 
 ## Google Workspace exports
 
-| Source | Export format |
-|--------|-------------|
-| Google Docs | Markdown (.md) |
-| Google Sheets | CSV (.csv) |
-| Google Slides | PDF (.pdf) |
-| Google Drawings | PNG (.png) |
+Workspace files are exported to formats that preserve full fidelity (all tabs, formatting, images):
+
+| Source | Export format | Why |
+|--------|-------------|-----|
+| Google Docs | DOCX (.docx) | Preserves images, tables, formatting |
+| Google Sheets | XLSX (.xlsx) | Preserves all tabs, formulas, formatting |
+| Google Slides | PDF (.pdf) | Universal, preserves layout |
+| Google Drawings | SVG (.svg) | Vector, lossless |
+
+Binary files (PDF, audio, video, archives, images, etc.) are downloaded as-is.
 
 Files that cannot be exported (Forms, Sites, Apps Script) are skipped automatically.

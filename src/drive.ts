@@ -8,10 +8,10 @@ import type { Logger } from "./logger";
 import type { IgnoreMatcher } from "./ignore";
 
 const EXPORT_MAP: Record<string, { mime: string; ext: string }> = {
-  "application/vnd.google-apps.document":     { mime: "text/markdown", ext: ".md" },
-  "application/vnd.google-apps.spreadsheet":  { mime: "text/csv", ext: ".csv" },
+  "application/vnd.google-apps.document":     { mime: "application/vnd.openxmlformats-officedocument.wordprocessingml.document", ext: ".docx" },
+  "application/vnd.google-apps.spreadsheet":  { mime: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", ext: ".xlsx" },
   "application/vnd.google-apps.presentation": { mime: "application/pdf", ext: ".pdf" },
-  "application/vnd.google-apps.drawing":      { mime: "image/png", ext: ".png" },
+  "application/vnd.google-apps.drawing":      { mime: "image/svg+xml", ext: ".svg" },
 };
 
 const SKIP_MIMES = new Set([
