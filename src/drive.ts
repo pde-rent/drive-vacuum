@@ -1,328 +1,200 @@
-/**
- * Google Drive API client for listing and downloading files.
- *
- * Uses a service account (JWT) for authentication.
- * Handles recursive folder traversal, binary downloads, and Google Workspace exports.
- */
-
 import { google, type drive_v3 } from "googleapis";
-import { mkdir, stat, writeFile } from "node:fs/promises";
+import { createWriteStream } from "node:fs";
+import { mkdir, rename, stat, unlink } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { pipeline } from "node:stream/promises";
+import type { Readable } from "node:stream";
 import type { Logger } from "./logger";
 import type { IgnoreMatcher } from "./ignore";
 
-// Google Workspace MIME types and their export targets
-const EXPORT_MAP: Record<string, { mimeType: string; extension: string }> = {
-  "application/vnd.google-apps.document": {
-    mimeType: "text/markdown",
-    extension: ".md",
-  },
-  "application/vnd.google-apps.spreadsheet": {
-    mimeType: "text/csv",
-    extension: ".csv",
-  },
-  "application/vnd.google-apps.presentation": {
-    mimeType: "application/pdf",
-    extension: ".pdf",
-  },
-  "application/vnd.google-apps.drawing": {
-    mimeType: "image/png",
-    extension: ".png",
-  },
+const EXPORT_MAP: Record<string, { mime: string; ext: string }> = {
+  "application/vnd.google-apps.document":     { mime: "text/markdown", ext: ".md" },
+  "application/vnd.google-apps.spreadsheet":  { mime: "text/csv", ext: ".csv" },
+  "application/vnd.google-apps.presentation": { mime: "application/pdf", ext: ".pdf" },
+  "application/vnd.google-apps.drawing":      { mime: "image/png", ext: ".png" },
 };
 
-// MIME types that cannot be downloaded (no binary, no export)
-const SKIP_MIME_TYPES = new Set([
-  "application/vnd.google-apps.form",
-  "application/vnd.google-apps.map",
-  "application/vnd.google-apps.site",
-  "application/vnd.google-apps.script",
+const SKIP_MIMES = new Set([
+  "application/vnd.google-apps.form", "application/vnd.google-apps.map",
+  "application/vnd.google-apps.site", "application/vnd.google-apps.script",
 ]);
 
-const FOLDER_MIME = "application/vnd.google-apps.folder";
-const SHORTCUT_MIME = "application/vnd.google-apps.shortcut";
+const FOLDER = "application/vnd.google-apps.folder";
+const SHORTCUT = "application/vnd.google-apps.shortcut";
+const FOLDER_ID_RE = /^[a-zA-Z0-9_-]+$/;
 
 export interface DriveFile {
-  id: string;
-  name: string;
-  mimeType: string;
-  size: number;
-  relativePath: string;
-  isGoogleWorkspace: boolean;
-  exportMimeType?: string;
-  exportExtension?: string;
+  id: string; name: string; size: number; relativePath: string;
+  exportMime?: string; exportExt?: string;
 }
 
-export interface DriveClientOptions {
-  keyFilePath: string;
-  logger: Logger;
-  ignoreMatcher: IgnoreMatcher;
-  concurrency: number;
-  dryRun: boolean;
-  outDir: string;
-}
+// Auth
 
-export async function createDriveClient(keyFilePath: string): Promise<drive_v3.Drive> {
-  const keyFileContent = await Bun.file(keyFilePath).json();
-
+export async function createDriveClient(keyPath: string): Promise<drive_v3.Drive> {
+  const key = await Bun.file(keyPath).json();
   const auth = new google.auth.GoogleAuth({
-    credentials: {
-      client_email: keyFileContent.client_email,
-      private_key: keyFileContent.private_key,
-    },
+    credentials: { client_email: key.client_email, private_key: key.private_key },
     scopes: ["https://www.googleapis.com/auth/drive.readonly"],
   });
-
   return google.drive({ version: "v3", auth });
 }
 
-/**
- * Recursively list all files in a Google Drive folder.
- */
-export async function listFilesRecursively(
-  drive: drive_v3.Drive,
-  folderId: string,
-  logger: Logger,
-  ignoreMatcher: IgnoreMatcher,
-  basePath: string = ""
+// Retry wrapper for transient Google API errors
+
+async function withRetry<T>(fn: () => Promise<T>, retries = 3): Promise<T> {
+  for (let attempt = 0; ; attempt++) {
+    try { return await fn(); }
+    catch (err: any) {
+      const status = err?.response?.status ?? err?.code;
+      if (attempt >= retries || ![429, 500, 503].includes(status)) throw err;
+      await new Promise(r => setTimeout(r, Math.min(1000 * 2 ** attempt, 16000) + Math.random() * 1000));
+    }
+  }
+}
+
+// Sanitize filenames (Google Drive allows /, \, and other OS-illegal chars)
+
+function sanitize(name: string): string {
+  return name.replace(/[/\\:*?"<>|]/g, "_");
+}
+
+// Listing
+
+export async function listFiles(
+  drive: drive_v3.Drive, folderId: string, logger: Logger,
+  ignore: IgnoreMatcher, basePath = "", visited = new Set<string>(),
 ): Promise<DriveFile[]> {
+  if (visited.has(folderId)) { logger.warn(`Circular reference: ${basePath}`); return []; }
+  visited.add(folderId);
+
   const files: DriveFile[] = [];
+  const subfolders: { id: string; path: string }[] = [];
   let pageToken: string | undefined;
 
   do {
-    const res = await drive.files.list({
+    const res = await withRetry(() => drive.files.list({
       q: `'${folderId}' in parents and trashed = false`,
-      fields:
-        "nextPageToken, files(id, name, mimeType, size, shortcutDetails)",
-      pageSize: 1000,
-      pageToken,
-    });
-
-    const items = res.data.files ?? [];
+      fields: "nextPageToken, files(id, name, mimeType, size, shortcutDetails)",
+      pageSize: 1000, pageToken,
+      includeItemsFromAllDrives: true, supportsAllDrives: true,
+    }));
     pageToken = res.data.nextPageToken ?? undefined;
 
-    for (const item of items) {
-      const name = item.name ?? "untitled";
-      const mimeType = item.mimeType ?? "application/octet-stream";
+    for (const item of res.data.files ?? []) {
+      const rawName = item.name ?? "untitled";
+      const name = sanitize(rawName);
+      const mime = item.mimeType ?? "application/octet-stream";
       const id = item.id ?? "";
-      const relativePath = basePath ? `${basePath}/${name}` : name;
+      const path = basePath ? `${basePath}/${name}` : name;
 
-      // Handle shortcuts: resolve to their target
-      if (mimeType === SHORTCUT_MIME) {
-        const targetId = item.shortcutDetails?.targetId;
-        const targetMime = item.shortcutDetails?.targetMimeType;
-        if (!targetId || !targetMime) {
-          logger.warn(`Skipping unresolvable shortcut: ${name}`);
-          continue;
-        }
-
-        if (targetMime === FOLDER_MIME) {
-          if (ignoreMatcher.isIgnored(relativePath, true)) {
-            logger.debug(`Ignored directory (shortcut): ${relativePath}`);
-            continue;
-          }
-          const subFiles = await listFilesRecursively(
-            drive,
-            targetId,
-            logger,
-            ignoreMatcher,
-            relativePath
-          );
-          files.push(...subFiles);
+      // Resolve shortcuts
+      if (mime === SHORTCUT) {
+        const tid = item.shortcutDetails?.targetId;
+        const tmime = item.shortcutDetails?.targetMimeType;
+        if (!tid || !tmime) { logger.warn(`Unresolvable shortcut: ${rawName}`); continue; }
+        if (tmime === FOLDER) {
+          if (!ignore.isIgnored(path, true)) subfolders.push({ id: tid, path });
         } else {
-          // Treat shortcut as the target file
-          processFileEntry(files, targetId, name, targetMime, item.size, relativePath, logger, ignoreMatcher);
+          addFile(files, tid, name, tmime, item.size, path, logger, ignore);
         }
         continue;
       }
 
-      // Recurse into folders
-      if (mimeType === FOLDER_MIME) {
-        if (ignoreMatcher.isIgnored(relativePath, true)) {
-          logger.debug(`Ignored directory: ${relativePath}`);
-          continue;
-        }
-        logger.debug(`Entering folder: ${relativePath}`);
-        const subFiles = await listFilesRecursively(
-          drive,
-          id,
-          logger,
-          ignoreMatcher,
-          relativePath
-        );
-        files.push(...subFiles);
+      if (mime === FOLDER) {
+        if (!ignore.isIgnored(path, true)) { logger.debug(`Entering: ${path}`); subfolders.push({ id, path }); }
         continue;
       }
 
-      processFileEntry(files, id, name, mimeType, item.size, relativePath, logger, ignoreMatcher);
+      addFile(files, id, name, mime, item.size, path, logger, ignore);
     }
   } while (pageToken);
+
+  // Parallel subfolder traversal (bounded)
+  const BATCH = 6;
+  for (let i = 0; i < subfolders.length; i += BATCH) {
+    const results = await Promise.all(
+      subfolders.slice(i, i + BATCH).map(f => listFiles(drive, f.id, logger, ignore, f.path, visited))
+    );
+    for (const r of results) for (const f of r) files.push(f);
+  }
 
   return files;
 }
 
-function processFileEntry(
-  files: DriveFile[],
-  id: string,
-  name: string,
-  mimeType: string,
-  rawSize: string | null | undefined,
-  relativePath: string,
-  logger: Logger,
-  ignoreMatcher: IgnoreMatcher
+function addFile(
+  files: DriveFile[], id: string, name: string, mime: string,
+  rawSize: string | null | undefined, path: string, logger: Logger, ignore: IgnoreMatcher,
 ): void {
-  // Skip unsupported Google Workspace types
-  if (SKIP_MIME_TYPES.has(mimeType)) {
-    logger.debug(`Skipping unsupported type (${mimeType}): ${name}`);
-    return;
-  }
-
-  const exportInfo = EXPORT_MAP[mimeType];
-  const isGoogleWorkspace = !!exportInfo;
-  let finalName = name;
-
-  if (isGoogleWorkspace && exportInfo) {
-    // Append export extension if the name does not already have it
-    if (!name.endsWith(exportInfo.extension)) {
-      finalName = name + exportInfo.extension;
-    }
-  }
-
-  const finalRelativePath = relativePath.endsWith(name)
-    ? relativePath.slice(0, -name.length) + finalName
-    : relativePath;
-
-  // Check ignore rules
-  if (ignoreMatcher.isIgnored(finalRelativePath, false)) {
-    logger.debug(`Ignored file: ${finalRelativePath}`);
-    return;
-  }
-
-  files.push({
-    id,
-    name: finalName,
-    mimeType,
-    size: parseInt(rawSize ?? "0", 10) || 0,
-    relativePath: finalRelativePath,
-    isGoogleWorkspace,
-    exportMimeType: exportInfo?.mimeType,
-    exportExtension: exportInfo?.extension,
-  });
+  if (SKIP_MIMES.has(mime)) { logger.debug(`Skip unsupported: ${name}`); return; }
+  const exp = EXPORT_MAP[mime];
+  const finalName = exp && !name.endsWith(exp.ext) ? name + exp.ext : name;
+  const finalPath = path.slice(0, -name.length) + finalName;
+  if (ignore.isIgnored(finalPath, false)) { logger.debug(`Ignored: ${finalPath}`); return; }
+  files.push({ id, name: finalName, size: Number(rawSize) || 0, relativePath: finalPath, exportMime: exp?.mime, exportExt: exp?.ext });
 }
 
-/**
- * Download a single file from Google Drive.
- * Returns the number of bytes written.
- */
-export async function downloadFile(
-  drive: drive_v3.Drive,
-  file: DriveFile,
-  outDir: string,
-  logger: Logger
-): Promise<number> {
-  const destPath = join(outDir, file.relativePath);
+// Downloading
 
-  // Ensure parent directory exists
-  await mkdir(dirname(destPath), { recursive: true });
+async function downloadOne(drive: drive_v3.Drive, file: DriveFile, outDir: string, logger: Logger): Promise<number> {
+  const dest = join(outDir, file.relativePath);
+  const tmp = dest + ".tmp";
 
-  // Skip if already exists with same size (for non-workspace files)
-  if (!file.isGoogleWorkspace && file.size > 0) {
-    try {
-      const existing = await stat(destPath);
-      if (existing.size === file.size) {
-        logger.debug(`Skipping (already exists): ${file.relativePath}`);
-        return 0;
-      }
-    } catch {
-      // File doesn't exist, proceed with download
-    }
+  // Skip if already exists with matching size
+  if (!file.exportMime && file.size > 0) {
+    try { if ((await stat(dest)).size === file.size) { logger.debug(`Exists: ${file.relativePath}`); return 0; } }
+    catch { /* not found */ }
   }
 
-  if (file.isGoogleWorkspace && file.exportMimeType) {
-    // Export Google Workspace files
-    const res = await drive.files.export(
-      { fileId: file.id, mimeType: file.exportMimeType },
-      { responseType: "arraybuffer" }
+  try {
+    const res = await withRetry(() =>
+      file.exportMime
+        ? drive.files.export({ fileId: file.id, mimeType: file.exportMime }, { responseType: "stream" })
+        : drive.files.get({ fileId: file.id, alt: "media" }, { responseType: "stream" })
     );
-    const data = Buffer.from(res.data as ArrayBuffer);
-    await writeFile(destPath, data);
-    return data.length;
-  } else {
-    // Download binary files
-    const res = await drive.files.get(
-      { fileId: file.id, alt: "media" },
-      { responseType: "arraybuffer" }
-    );
-    const data = Buffer.from(res.data as ArrayBuffer);
-    await writeFile(destPath, data);
-    return data.length;
+    const ws = createWriteStream(tmp);
+    await pipeline(res.data as Readable, ws);
+    await rename(tmp, dest);
+    return ws.bytesWritten;
+  } catch (err) {
+    await unlink(tmp).catch(() => {});
+    throw err;
   }
 }
 
-/**
- * Download multiple files with concurrency control.
- */
 export async function downloadAll(
-  drive: drive_v3.Drive,
-  files: DriveFile[],
-  outDir: string,
-  concurrency: number,
-  logger: Logger
+  drive: drive_v3.Drive, files: DriveFile[], outDir: string, concurrency: number, logger: Logger,
 ): Promise<{ downloaded: number; skipped: number; totalBytes: number; errors: string[] }> {
-  let downloaded = 0;
-  let skipped = 0;
-  let totalBytes = 0;
+  // Pre-create all directories at once
+  const dirs = new Set(files.map(f => dirname(join(outDir, f.relativePath))));
+  await Promise.all([...dirs].map(d => mkdir(d, { recursive: true })));
+
+  let downloaded = 0, skipped = 0, totalBytes = 0, completed = 0;
   const errors: string[] = [];
-  let completed = 0;
+  let idx = 0;
 
-  // Simple semaphore for concurrency
-  let running = 0;
-  const queue = [...files];
-
-  async function processNext(): Promise<void> {
-    while (queue.length > 0) {
-      const file = queue.shift()!;
+  async function worker(): Promise<void> {
+    while (idx < files.length) {
+      const file = files[idx++];
       try {
-        const bytes = await downloadFile(drive, file, outDir, logger);
-        if (bytes > 0) {
-          downloaded++;
-          totalBytes += bytes;
-        } else {
-          skipped++;
-        }
+        const bytes = await downloadOne(drive, file, outDir, logger);
+        if (bytes > 0) { downloaded++; totalBytes += bytes; } else { skipped++; }
       } catch (err: any) {
-        const msg = `Failed to download ${file.relativePath}: ${err.message ?? err}`;
-        logger.error(msg);
-        errors.push(msg);
+        const msg = `${file.relativePath}: ${err.message ?? err}`;
+        logger.error(msg); errors.push(msg);
       }
-      completed++;
-      logger.progress(completed, files.length, file.name, file.size);
+      logger.progress(++completed, files.length, file.name, file.size);
     }
   }
 
-  // Launch concurrent workers
-  const workers = Array.from({ length: Math.min(concurrency, files.length) }, () =>
-    processNext()
-  );
-  await Promise.all(workers);
-
+  await Promise.all(Array.from({ length: Math.min(concurrency, files.length) }, worker));
   return { downloaded, skipped, totalBytes, errors };
 }
 
-/**
- * Extract a folder ID from a Google Drive URL or return the input as-is.
- */
+// URL / ID extraction
+
 export function extractFolderId(input: string): string {
-  // Match URLs like https://drive.google.com/drive/folders/XXXXX?...
-  const urlMatch = input.match(
-    /drive\.google\.com\/drive\/(?:u\/\d+\/)?folders\/([a-zA-Z0-9_-]+)/
-  );
-  if (urlMatch) return urlMatch[1];
-
-  // Match URLs like https://drive.google.com/open?id=XXXXX
-  const openMatch = input.match(/drive\.google\.com\/open\?id=([a-zA-Z0-9_-]+)/);
-  if (openMatch) return openMatch[1];
-
-  // Assume it's already a folder ID
-  return input.trim();
+  const m = input.match(/drive\.google\.com\/(?:drive\/(?:u\/\d+\/)?folders|open\?id=)\/?([\w-]+)/);
+  const id = m ? m[1] : input.trim();
+  if (!FOLDER_ID_RE.test(id)) throw new Error(`Invalid folder ID: ${id}`);
+  return id;
 }

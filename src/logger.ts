@@ -1,62 +1,7 @@
-const RESET = "\x1b[0m";
-const BOLD = "\x1b[1m";
-const DIM = "\x1b[2m";
-const RED = "\x1b[31m";
-const GREEN = "\x1b[32m";
-const YELLOW = "\x1b[33m";
-const BLUE = "\x1b[34m";
-const CYAN = "\x1b[36m";
-const GRAY = "\x1b[90m";
+const c = (code: string, tag: string, msg: string) =>
+  console.log(`\x1b[${code}m[${tag}]\x1b[0m ${msg}`);
 
-export interface Logger {
-  info(msg: string): void;
-  success(msg: string): void;
-  warn(msg: string): void;
-  error(msg: string): void;
-  debug(msg: string): void;
-  progress(current: number, total: number, fileName: string, size?: number): void;
-  banner(): void;
-}
-
-export function createLogger(verbose: boolean): Logger {
-  return {
-    info(msg: string) {
-      console.log(`${BLUE}[info]${RESET} ${msg}`);
-    },
-
-    success(msg: string) {
-      console.log(`${GREEN}[done]${RESET} ${msg}`);
-    },
-
-    warn(msg: string) {
-      console.log(`${YELLOW}[warn]${RESET} ${msg}`);
-    },
-
-    error(msg: string) {
-      console.error(`${RED}[error]${RESET} ${msg}`);
-    },
-
-    debug(msg: string) {
-      if (verbose) {
-        console.log(`${GRAY}[debug]${RESET} ${DIM}${msg}${RESET}`);
-      }
-    },
-
-    progress(current: number, total: number, fileName: string, size?: number) {
-      const pct = total > 0 ? Math.round((current / total) * 100) : 0;
-      const sizeStr = size != null ? ` (${formatBytes(size)})` : "";
-      const bar = progressBar(pct, 20);
-      process.stdout.write(
-        `\r${CYAN}${bar}${RESET} ${BOLD}${pct}%${RESET} [${current}/${total}] ${fileName}${sizeStr}  `
-      );
-      if (current === total) {
-        process.stdout.write("\n");
-      }
-    },
-
-    banner() {
-      const art = `
-${BOLD}${CYAN}     ____________
+export const BANNER = `\n\x1b[1m\x1b[36m     ____________
     [____________]
      |  ◉    ◉  |
      | DRIVE    |
@@ -64,23 +9,31 @@ ${BOLD}${CYAN}     ____________
      |___|  |___|
     /====|  |====\\
    |_____|__|_____|
-      @        @${RESET}
-`;
-      console.log(art);
+      @        @\x1b[0m\n`;
+
+export function createLogger(verbose: boolean) {
+  return {
+    info: (msg: string) => c("34", "info", msg),
+    success: (msg: string) => c("32", "done", msg),
+    warn: (msg: string) => c("33", "warn", msg),
+    error: (msg: string) => console.error(`\x1b[31m[error]\x1b[0m ${msg}`),
+    debug: (msg: string) => { if (verbose) c("90", "debug", msg); },
+    progress(cur: number, total: number, name: string, size?: number) {
+      const pct = total > 0 ? Math.round((cur / total) * 100) : 0;
+      const filled = Math.round((pct / 100) * 20);
+      const bar = `[${"█".repeat(filled)}${"░".repeat(20 - filled)}]`;
+      const s = size != null ? ` (${fmtBytes(size)})` : "";
+      process.stdout.write(`\r\x1b[K\x1b[36m${bar}\x1b[0m \x1b[1m${pct}%\x1b[0m [${cur}/${total}] ${name}${s}`);
+      if (cur === total) process.stdout.write("\n");
     },
   };
 }
 
-function progressBar(pct: number, width: number): string {
-  const filled = Math.round((pct / 100) * width);
-  const empty = width - filled;
-  return `[${"█".repeat(filled)}${"░".repeat(empty)}]`;
-}
+export type Logger = ReturnType<typeof createLogger>;
 
-export function formatBytes(bytes: number): string {
-  if (bytes === 0) return "0 B";
+export function fmtBytes(bytes: number): string {
+  if (bytes <= 0) return "0 B";
   const units = ["B", "KB", "MB", "GB", "TB"];
   const i = Math.floor(Math.log(bytes) / Math.log(1024));
-  const value = bytes / Math.pow(1024, i);
-  return `${value.toFixed(i > 0 ? 1 : 0)} ${units[i]}`;
+  return `${(bytes / 1024 ** i).toFixed(i > 0 ? 1 : 0)} ${units[i]}`;
 }
