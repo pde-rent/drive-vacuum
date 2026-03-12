@@ -1,0 +1,18 @@
+{
+  "name": "drive-vacuum",
+  "version": "1.0.0",
+  "description": "Recursively download all files from a Google Drive folder using a service account",
+  "type": "module",
+  "bin": {
+    "drive-vacuum": "./src/index.ts"
+  },
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "lint": "bunx oxlint",
+    "format": "bunx oxfmt",
+    "typecheck": "bunx tsgo --noEmit"
+  },
+  "dependencies": {
+    "googleapis": "^144.0.0"
+  }
+}

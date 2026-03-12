@@ -1,0 +1,27 @@
+# drive-vacuum ignore file
+# Syntax: gitignore-like patterns
+
+# Ignore by extension
+*.zip
+*.tar.gz
+*.exe
+
+# Ignore specific files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Ignore directories
+node_modules/
+.git/
+__pycache__/
+
+# Glob patterns
+temp_*
+*.tmp
+
+# Negate (include even if matched above)
+!important.zip
+
+# Regex-like patterns work too
+test_*.log
